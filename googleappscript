@@ -1,0 +1,1165 @@
+// Global cache for spreadsheet data to reduce repeated reads
+var SPREADSHEET_CACHE = {};
+
+/**
+ * Helper function to check if an event should be ignored for conflict detection
+ * (i.e., allows double booking) - Simplified for performance
+ */
+function shouldIgnoreEvent(event) {
+  return (event.getTitle() || "").indexOf("#") !== -1;
+}
+
+/**
+ * Main entry point for the web API - GET requests
+ */
+function doGet(e) {
+  // Extract parameters
+  var calendarId = e.parameter.calendarId;
+  var jobType = e.parameter.jobType;
+  var startTime = e.parameter.startTime;
+  var endTime = e.parameter.endTime;
+  var loadAll = e.parameter.loadAll === "true";
+  var requestedDate = e.parameter.date;
+  var userTimezone = e.parameter.timezone || "Etc/UTC";
+  var bypassCache = e.parameter.bypassCache === "true";
+  
+  // Log essential request details only
+  Logger.log("Request: calendarId=" + calendarId + ", jobType=" + jobType + ", userTimezone=" + userTimezone);
+  
+  // Validate required parameters
+  if (!calendarId || !jobType || !startTime || !endTime) {
+    return ContentService.createTextOutput(JSON.stringify({
+      error: "Missing required parameters"
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+  
+  try {
+    // Get access to the spreadsheet
+    var spreadsheet = SpreadsheetApp.openById("1b78ApTXWjfg2Lsfdg3dBATZKGByKIEvCZ3GXOZ_GsYs");
+    
+    // Check cache first if not bypassing
+    if (!bypassCache && loadAll) {
+      var cachedData = getCachedAvailability(spreadsheet, calendarId, jobType);
+      if (cachedData && cachedData.timestamp) {
+        // Check if cache is still valid (less than 6 hours old)
+        var cacheTime = new Date(cachedData.timestamp);
+        var currentTime = new Date();
+        var cacheAgeHours = (currentTime - cacheTime) / (1000 * 60 * 60);
+        
+        if (cacheAgeHours < 6) {  // Cache is valid for 6 hours
+          // Get job settings even when using cache
+          var jobSettings = getJobSettings(spreadsheet, jobType);
+          
+          // Return cached data with job settings
+          return ContentService.createTextOutput(JSON.stringify({
+            jobDetails: {
+              title: jobSettings.title || jobType,
+              description: jobSettings.description || "",
+              duration: jobSettings.duration || 30
+            },
+            availableDates: cachedData.availableDates,
+            calendarTimezone: cachedData.calendarTimezone,
+            fromCache: true,
+            cacheAge: Math.round(cacheAgeHours * 10) / 10 + " hours"
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+      }
+    }
+    
+    // If we get here, cache was bypassed, invalid, or expired
+    
+    // Get the calendar for availability checking
+    var calendar = CalendarApp.getCalendarById(calendarId);
+    if (!calendar) {
+      return ContentService.createTextOutput(JSON.stringify({
+        error: "Calendar not found or access denied"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // Use the calendar's timezone if no user timezone is provided
+    var operatingTimezone = userTimezone || calendar.getTimeZone();
+    
+    // *** OPTIMIZATION: Load all required data from spreadsheet at once ***
+    
+    // Step 1: Get date overrides
+    var dateOverrides = getDateOverrides(spreadsheet, calendarId, jobType);
+    
+    // Step 2: Get day availability settings
+    var daySettings = getDayAvailability(spreadsheet, calendarId, jobType);
+    
+    // Convert day settings to a numeric map for easier access
+    var dayAvailability = {
+      "0": daySettings.sunday || "N",    // Sunday
+      "1": daySettings.monday || "N",    // Monday
+      "2": daySettings.tuesday || "N",   // Tuesday
+      "3": daySettings.wednesday || "N", // Wednesday
+      "4": daySettings.thursday || "N",  // Thursday
+      "5": daySettings.friday || "N",    // Friday
+      "6": daySettings.saturday || "N"   // Saturday
+    };
+    
+    // Step 3: Get job settings
+    var jobSettings = getJobSettings(spreadsheet, jobType);
+    
+    // Create the response object with enhanced job details
+    var response = {
+      jobDetails: {
+        title: jobSettings.title || jobType,
+        description: jobSettings.description || "",
+        duration: jobSettings.duration || 30
+      },
+      calendarTimezone: calendar.getTimeZone(),
+      fromCache: false
+    };
+    
+    // Handle the request based on loadAll parameter
+    if (loadAll) {
+      // Get availability for the next 30 days (optimized version)
+      response.availableDates = getAvailabilityFor30Days(
+        calendar,
+        dateOverrides,
+        dayAvailability,
+        jobSettings,
+        operatingTimezone,
+        startTime,
+        endTime
+      );
+      
+      // Save to cache
+      saveToCache(spreadsheet, calendarId, jobType, response.availableDates, calendar.getTimeZone());
+      
+      // Update the SlotsAvailable tracking
+      updateSlotsAvailable(spreadsheet, calendarId, jobType, response.availableDates);
+    } else if (requestedDate) {
+      // Get availability for a specific date (optimized version)
+      var result = getAvailabilityForDate(
+        calendar,
+        requestedDate,
+        dateOverrides,
+        dayAvailability,
+        jobSettings,
+        operatingTimezone,
+        startTime,
+        endTime
+      );
+      
+      response.availableSlots = result.availableSlots;
+      response.availabilityType = result.availabilityType;
+      
+      if (result.error) {
+        response.error = result.error;
+      }
+    } else {
+      response.error = "Either loadAll must be true or date must be specified";
+    }
+    
+    return ContentService.createTextOutput(JSON.stringify(response))
+      .setMimeType(ContentService.MimeType.JSON);
+    
+  } catch (error) {
+    // Return any errors that occur
+    return ContentService.createTextOutput(JSON.stringify({
+      error: "Server error: " + error.message
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Handle POST requests - used for removing booked slots from cache
+ */
+function doPost(e) {
+  try {
+    // Parse the JSON request data
+    var requestData = JSON.parse(e.postData.contents);
+    
+    // Check for required parameters
+    if (!requestData.calendarId || !requestData.jobType || !requestData.date || !requestData.time) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "Missing required parameters"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // Get the spreadsheet
+    var spreadsheet = SpreadsheetApp.openById("1b78ApTXWjfg2Lsfdg3dBATZKGByKIEvCZ3GXOZ_GsYs");
+    
+    // Get the cached data
+    var cachedData = getCachedAvailability(spreadsheet, requestData.calendarId, requestData.jobType);
+    if (!cachedData || !cachedData.availableDates) {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "Cache not found"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // Find and remove the time slot from the cache
+    var dateStr = requestData.date;
+    var timeStr = requestData.time;
+    
+    if (cachedData.availableDates[dateStr] && cachedData.availableDates[dateStr].slots) {
+      // Find the index of the time slot
+      var slots = cachedData.availableDates[dateStr].slots;
+      var index = slots.indexOf(timeStr);
+      
+      if (index !== -1) {
+        // Remove the time slot
+        slots.splice(index, 1);
+        
+        // If no slots left for this date, remove the date entry
+        if (slots.length === 0) {
+          delete cachedData.availableDates[dateStr];
+        }
+        
+        // Save the updated cache
+        saveToCache(spreadsheet, requestData.calendarId, requestData.jobType, cachedData.availableDates, cachedData.calendarTimezone);
+        
+        // Update SlotsAvailable tracking
+        updateSlotsAvailable(spreadsheet, requestData.calendarId, requestData.jobType, cachedData.availableDates);
+        
+        return ContentService.createTextOutput(JSON.stringify({
+          success: true,
+          message: "Time slot removed from cache"
+        })).setMimeType(ContentService.MimeType.JSON);
+      } else {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: "Time slot not found in cache"
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    } else {
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: "Date not found in cache"
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({
+      success: false,
+      error: "Server error: " + error.message
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Helper function to get cached sheet data or load it if not cached
+ */
+function getCachedSheetData(spreadsheet, sheetName) {
+  // Check if data is already cached
+  if (!SPREADSHEET_CACHE[sheetName]) {
+    // Get the sheet
+    var sheet = spreadsheet.getSheetByName(sheetName);
+    if (!sheet) {
+      return null;
+    }
+    
+    // Load data and cache it
+    SPREADSHEET_CACHE[sheetName] = sheet.getDataRange().getValues();
+  }
+  
+  return SPREADSHEET_CACHE[sheetName];
+}
+
+/**
+ * Get cached availability from the AvailabilityCache sheet
+ */
+function getCachedAvailability(spreadsheet, calendarId, jobType) {
+  try {
+    // Get cached sheet data or load it if not cached
+    var data = getCachedSheetData(spreadsheet, "AvailabilityCache");
+    if (!data || data.length <= 1) {
+      return null;
+    }
+    
+    // Assuming headers: CalendarId, JobType, lastUpdated, availabilityData
+    var calendarIdIndex = 0;
+    var jobTypeIndex = 1;
+    var lastUpdatedIndex = 2;
+    var availabilityDataIndex = 3;
+    
+    // Normalize input for case-insensitive comparison
+    var normalizedCalendarId = normalizeText(calendarId);
+    var normalizedJobType = normalizeText(jobType);
+    
+    // Find the matching row
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var rowCalendarId = normalizeText(row[calendarIdIndex]);
+      var rowJobType = normalizeText(row[jobTypeIndex]);
+      
+      // Case-insensitive match
+      if (rowCalendarId === normalizedCalendarId && rowJobType === normalizedJobType) {
+        // Get the last updated timestamp
+        var timestamp = row[lastUpdatedIndex];
+        
+        // Parse the availability data JSON
+        try {
+          var availabilityData = JSON.parse(row[availabilityDataIndex]);
+          
+          return {
+            timestamp: timestamp,
+            availableDates: availabilityData.dates || {},
+            calendarTimezone: availabilityData.timezone || "Etc/UTC"
+          };
+        } catch (error) {
+          // If JSON parsing fails, return null
+          return null;
+        }
+      }
+    }
+    
+    return null;
+    
+  } catch (error) {
+    Logger.log("Error in getCachedAvailability: " + error.message);
+    return null;
+  }
+}
+
+/**
+ * Save availability data to the AvailabilityCache sheet
+ */
+function saveToCache(spreadsheet, calendarId, jobType, availabilityData, timezone) {
+  try {
+    // Get the AvailabilityCache sheet
+    var sheet = spreadsheet.getSheetByName("AvailabilityCache");
+    if (!sheet) {
+      return false;
+    }
+    
+    // Get cached sheet data or load it
+    var data = getCachedSheetData(spreadsheet, "AvailabilityCache");
+    if (!data || data.length === 0) {
+      // If empty, add headers
+      sheet.appendRow(["CalendarId", "JobType", "lastUpdated", "availabilityData"]);
+      data = [["CalendarId", "JobType", "lastUpdated", "availabilityData"]];
+    }
+    
+    // Assuming headers: CalendarId, JobType, lastUpdated, availabilityData
+    var calendarIdIndex = 0;
+    var jobTypeIndex = 1;
+    var lastUpdatedIndex = 2;
+    var availabilityDataIndex = 3;
+    
+    // Current timestamp
+    var timestamp = new Date();
+    
+    // Prepare data to cache
+    var cacheData = JSON.stringify({
+      dates: availabilityData,
+      timezone: timezone
+    });
+    
+    // Normalize input for case-insensitive comparison
+    var normalizedCalendarId = normalizeText(calendarId);
+    var normalizedJobType = normalizeText(jobType);
+    
+    // Find the matching row to update
+    var rowIndex = -1;
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var rowCalendarId = normalizeText(row[calendarIdIndex]);
+      var rowJobType = normalizeText(row[jobTypeIndex]);
+      
+      // Case-insensitive match
+      if (rowCalendarId === normalizedCalendarId && rowJobType === normalizedJobType) {
+        rowIndex = i + 1; // +1 because sheets are 1-indexed
+        break;
+      }
+    }
+    
+    if (rowIndex > 0) {
+      // Update existing row
+      sheet.getRange(rowIndex, lastUpdatedIndex + 1, 1, 1).setValue(timestamp);
+      sheet.getRange(rowIndex, availabilityDataIndex + 1, 1, 1).setValue(cacheData);
+    } else {
+      // Add new row
+      sheet.appendRow([calendarId, jobType, timestamp, cacheData]);
+    }
+    
+    return true;
+    
+  } catch (error) {
+    Logger.log("Error in saveToCache: " + error.message);
+    return false;
+  }
+}
+
+/**
+ * Update the SlotsAvailable sheet with the count of available slots
+ */
+function updateSlotsAvailable(spreadsheet, calendarId, jobType, availabilityData) {
+  try {
+    // Get the SlotsAvailable sheet
+    var sheet = spreadsheet.getSheetByName("SlotsAvailable");
+    if (!sheet) {
+      return false;
+    }
+    
+    // Get cached sheet data or load it
+    var data = getCachedSheetData(spreadsheet, "SlotsAvailable");
+    if (!data || data.length === 0) {
+      // If empty, add headers
+      sheet.appendRow(["calendarId", "jobType", "SlotsAvailable", "LastUpdated"]);
+      data = [["calendarId", "jobType", "SlotsAvailable", "LastUpdated"]];
+    }
+    
+    // Assuming headers: calendarId, jobType, SlotsAvailable, LastUpdated
+    var calendarIdIndex = 0;
+    var jobTypeIndex = 1;
+    var slotsAvailableIndex = 2;
+    var lastUpdatedIndex = 3;
+    
+    // Count total slots available
+    var totalSlots = 0;
+    
+    if (availabilityData) {
+      Object.keys(availabilityData).forEach(function(dateKey) {
+        var dateData = availabilityData[dateKey];
+        if (dateData && dateData.slots && Array.isArray(dateData.slots)) {
+          totalSlots += dateData.slots.length;
+        }
+      });
+    }
+    
+    // Current timestamp
+    var timestamp = new Date();
+    
+    // Normalize input for case-insensitive comparison
+    var normalizedCalendarId = normalizeText(calendarId);
+    var normalizedJobType = normalizeText(jobType);
+    
+    // Find the matching row to update
+    var rowIndex = -1;
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var rowCalendarId = normalizeText(row[calendarIdIndex]);
+      var rowJobType = normalizeText(row[jobTypeIndex]);
+      
+      // Case-insensitive match
+      if (rowCalendarId === normalizedCalendarId && rowJobType === normalizedJobType) {
+        rowIndex = i + 1; // +1 because sheets are 1-indexed
+        break;
+      }
+    }
+    
+    if (rowIndex > 0) {
+      // Update existing row
+      sheet.getRange(rowIndex, slotsAvailableIndex + 1, 1, 1).setValue(totalSlots);
+      sheet.getRange(rowIndex, lastUpdatedIndex + 1, 1, 1).setValue(timestamp);
+    } else {
+      // Add new row
+      sheet.appendRow([calendarId, jobType, totalSlots, timestamp]);
+    }
+    
+    return true;
+    
+  } catch (error) {
+    Logger.log("Error updating SlotsAvailable: " + error.message);
+    return false;
+  }
+}
+
+/**
+ * Gets date overrides from the DateOverrides sheet with timezone handling
+ */
+function getDateOverrides(spreadsheet, calendarId, jobType) {
+  var overrides = {};
+  
+  try {
+    // Get cached sheet data or load it
+    var data = getCachedSheetData(spreadsheet, "DateOverrides");
+    if (!data || data.length <= 1) {
+      return overrides;
+    }
+    
+    // Get the script's timezone for consistent date handling
+    var scriptTimezone = Session.getScriptTimeZone();
+    
+    // Normalize input for case-insensitive comparison
+    var normalizedCalendarId = normalizeText(calendarId);
+    var normalizedJobType = normalizeText(jobType);
+    
+    // Process each row in the sheet (skip header row)
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      
+      // Skip completely empty rows
+      if (!row[0] && !row[1] && !row[2] && !row[3]) {
+        continue;
+      }
+      
+      // Extract values from the row
+      var rowCalendarId = normalizeText(row[0]);
+      var rowJobType = normalizeText(row[1]);
+      var rowDate = row[2]; // Date value
+      var rowOverrideValue = String(row[3] || "").trim().toUpperCase();
+      
+      // Case-insensitive match for calendarId and jobType
+      if (rowCalendarId === normalizedCalendarId && rowJobType === normalizedJobType) {
+        // Ensure the date is valid
+        if (rowDate instanceof Date && !isNaN(rowDate.getTime())) {
+          // Use the script's timezone instead of GMT to ensure date consistency
+          var dateStr = Utilities.formatDate(rowDate, scriptTimezone, "yyyy-MM-dd");
+          
+          // Store the override value
+          overrides[dateStr] = rowOverrideValue;
+        }
+      }
+    }
+    
+    return overrides;
+    
+  } catch (error) {
+    Logger.log("Error in getDateOverrides: " + error.message);
+    return overrides;
+  }
+}
+
+/**
+ * Gets day availability settings from the Show Alternative Days sheet
+ */
+function getDayAvailability(spreadsheet, calendarId, jobType) {
+  var availability = {
+    sunday: "N",
+    monday: "N", 
+    tuesday: "N",
+    wednesday: "N",
+    thursday: "N",
+    friday: "N",
+    saturday: "N"
+  };
+  
+  try {
+    // Get cached sheet data or load it
+    var data = getCachedSheetData(spreadsheet, "Show Alternative Days");
+    if (!data || data.length <= 1) {
+      return availability;
+    }
+    
+    // Get the headers
+    var headers = data[0];
+    
+    // Find column indexes
+    var calendarIdIndex = -1;
+    var jobTypeIndex = -1;
+    var dayIndexes = {
+      sunday: -1,
+      monday: -1,
+      tuesday: -1,
+      wednesday: -1,
+      thursday: -1,
+      friday: -1,
+      saturday: -1
+    };
+    
+    // Map headers to column indexes
+    for (var i = 0; i < headers.length; i++) {
+      var header = normalizeText(headers[i]);
+      
+      // Calendar ID
+      if (header === "calendarid" || header === "calendar id" || header === "calendar") {
+        calendarIdIndex = i;
+      }
+      // Job Type
+      else if (header === "jobtype" || header === "job type" || header === "job") {
+        jobTypeIndex = i;
+      }
+      // Sunday
+      else if (header === "sunday" || header === "sun" || header === "su") {
+        dayIndexes.sunday = i;
+      }
+      // Monday
+      else if (header === "monday" || header === "mon" || header === "mo") {
+        dayIndexes.monday = i;
+      }
+      // Tuesday
+      else if (header === "tuesday" || header === "tue" || header === "tu") {
+        dayIndexes.tuesday = i;
+      }
+      // Wednesday
+      else if (header === "wednesday" || header === "wed" || header === "we") {
+        dayIndexes.wednesday = i;
+      }
+      // Thursday
+      else if (header === "thursday" || header === "thu" || header === "th") {
+        dayIndexes.thursday = i;
+      }
+      // Friday
+      else if (header === "friday" || header === "fri" || header === "fr") {
+        dayIndexes.friday = i;
+      }
+      // Saturday
+      else if (header === "saturday" || header === "sat" || header === "sa") {
+        dayIndexes.saturday = i;
+      }
+    }
+    
+    // Make sure we have the necessary columns
+    if (calendarIdIndex === -1 || jobTypeIndex === -1) {
+      return availability;
+    }
+    
+    // Normalize input for case-insensitive comparison
+    var normalizedCalendarId = normalizeText(calendarId);
+    var normalizedJobType = normalizeText(jobType);
+    
+    // Find the matching row
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var rowCalendarId = normalizeText(row[calendarIdIndex]);
+      var rowJobType = normalizeText(row[jobTypeIndex]);
+      
+      // Case-insensitive match
+      if (rowCalendarId === normalizedCalendarId && rowJobType === normalizedJobType) {
+        // Get day availability values
+        for (var day in dayIndexes) {
+          if (dayIndexes[day] !== -1) {
+            var value = String(row[dayIndexes[day]] || "N").trim().toUpperCase();
+            
+            // Validate availability value
+            if (value !== "F" && value !== "P" && value !== "N" && 
+                value !== "M" && value !== "L" && value !== "A" && 
+                value !== "E" && value !== "O") {
+              value = "N";
+            }
+            
+            availability[day] = value;
+          }
+        }
+        
+        return availability;
+      }
+    }
+    
+    return availability;
+    
+  } catch (error) {
+    Logger.log("Error in getDayAvailability: " + error.message);
+    return availability;
+  }
+}
+
+/**
+ * Gets job settings from the JobTypesConfiguration sheet with hardcoded column indexes
+ */
+function getJobSettings(spreadsheet, jobType) {
+  var settings = {
+    duration: 30,
+    spacing: 0,
+    minNotice: 1440,  // Default is 24 hours (1440 minutes)
+    startIntervals: 0,
+    title: "",
+    description: ""
+  };
+  
+  try {
+    // Get cached sheet data or load it
+    var data = getCachedSheetData(spreadsheet, "JobTypesConfiguration");
+    if (!data || data.length <= 1) {
+      return settings;
+    }
+    
+    // HARDCODED COLUMN INDEXES - Adjust these to match your spreadsheet
+    var jobTypeIndex = 0;  // First column (A)
+    var durationIndex = 1;  // Second column (B)
+    var spacingIndex = 2;   // Third column (C)
+    var minNoticeIndex = 3; // Fourth column (D)
+    var startIntervalsIndex = 4; // Fifth column (E)
+    var titleIndex = 5;     // Sixth column (F)
+    var descriptionIndex = 6; // Seventh column (G)
+    
+    // Normalize the target job type for case-insensitive comparison
+    var normalizedTargetJobType = normalizeText(jobType);
+    
+    // Find the matching row
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      
+      // Skip completely empty rows
+      if (!row.some(function(cell) { return cell !== ""; })) {
+        continue;
+      }
+      
+      var rowJobType = normalizeText(row[jobTypeIndex]);
+      
+      // Case-insensitive match
+      if (rowJobType === normalizedTargetJobType) {
+        // Get settings values with better validation
+        if (durationIndex >= 0 && row[durationIndex] !== null && row[durationIndex] !== "") {
+          settings.duration = parseNumericValue(row[durationIndex]);
+        }
+        
+        if (spacingIndex >= 0 && row[spacingIndex] !== null && row[spacingIndex] !== "") {
+          settings.spacing = parseNumericValue(row[spacingIndex]);
+        }
+        
+        if (minNoticeIndex >= 0 && row[minNoticeIndex] !== null && row[minNoticeIndex] !== "") {
+          settings.minNotice = parseNumericValue(row[minNoticeIndex]);
+        }
+        
+        if (startIntervalsIndex >= 0 && row[startIntervalsIndex] !== null && row[startIntervalsIndex] !== "") {
+          settings.startIntervals = parseNumericValue(row[startIntervalsIndex]);
+        }
+        
+        if (titleIndex >= 0 && row[titleIndex] !== null && row[titleIndex] !== "") {
+          settings.title = String(row[titleIndex]);
+        }
+        
+        if (descriptionIndex >= 0 && row[descriptionIndex] !== null && row[descriptionIndex] !== "") {
+          settings.description = String(row[descriptionIndex]);
+        }
+        
+        break;
+      }
+    }
+    
+    return settings;
+    
+  } catch (error) {
+    Logger.log("Error in getJobSettings: " + error.message);
+    return settings;
+  }
+}
+
+/**
+ * Helper function to normalize text for comparison
+ */
+function normalizeText(text) {
+  if (text === null || text === undefined) {
+    return "";
+  }
+  
+  // Convert to string, trim whitespace, and convert to lowercase
+  return String(text).replace(/^\s+|\s+$/g, "").toLowerCase();
+}
+
+/**
+ * Helper function to parse numeric values
+ */
+function parseNumericValue(value) {
+  if (typeof value === 'number') {
+    return value;
+  }
+  
+  // Convert to string and try to parse as number
+  var stringValue = String(value).replace(/[^\d.]/g, "");
+  var parsedValue = parseFloat(stringValue);
+  
+  return isNaN(parsedValue) ? 0 : parsedValue;
+}
+
+/**
+ * Optimized function to get availability for the next 30 days
+ */
+function getAvailabilityFor30Days(calendar, dateOverrides, dayAvailability, jobSettings, timezone, startTimeDefault, endTimeDefault) {
+  var availability = {};
+  
+  // Get current date in the specified timezone
+  var now = new Date();
+  var nowStr = Utilities.formatDate(now, timezone, "yyyy-MM-dd'T'HH:mm:ss");
+  var nowInTimezone = new Date(nowStr);
+  
+  // Pre-process all dates to determine availability type (avoiding repeated checks)
+  var datesWithAvailability = [];
+  var dateStrMap = {};
+  
+  for (var i = 0; i < 60; i++) {
+    var date = new Date(nowInTimezone);
+    date.setDate(nowInTimezone.getDate() + i);
+    var dateStr = Utilities.formatDate(date, timezone, "yyyy-MM-dd");
+    var dayOfWeek = date.getDay();
+    
+    // Determine availability type by priority
+    var availabilityType = "N";
+    if (dateOverrides && dateOverrides[dateStr]) {
+      availabilityType = dateOverrides[dateStr];
+    } else if (dayAvailability && dayAvailability[dayOfWeek]) {
+      availabilityType = dayAvailability[dayOfWeek];
+    }
+    
+    // Only store if potentially available (anything other than "N")
+    if (availabilityType !== "N") {
+      datesWithAvailability.push({
+        date: date,
+        dateStr: dateStr,
+        availabilityType: availabilityType
+      });
+      dateStrMap[dateStr] = true;
+    }
+  }
+  
+  // *** OPTIMIZATION: Batch calendar queries for multiple days ***
+  // This approach significantly reduces the number of calendar API calls
+  // Process dates in batches of 5 days for better performance
+  
+  const batchSize = 5; // Process 5 days at a time
+  for (let i = 0; i < datesWithAvailability.length; i += batchSize) {
+    const batch = datesWithAvailability.slice(i, i + batchSize);
+    
+    // Process this batch of dates
+    for (let j = 0; j < batch.length; j++) {
+      const dateInfo = batch[j];
+      
+      // Get time slots for this date
+      var result = getTimeSlotsForDate(
+        calendar,
+        dateInfo.date,
+        dateInfo.availabilityType,
+        jobSettings,
+        timezone,
+        startTimeDefault,
+        endTimeDefault,
+        nowInTimezone
+      );
+
+// Only add dates with available slots
+      if (result.slots && result.slots.length > 0) {
+        availability[dateInfo.dateStr] = {
+          slots: result.slots,
+          availabilityType: dateInfo.availabilityType
+        };
+      }
+    }
+  }
+  
+  return availability;
+}
+
+/**
+ * Gets availability for a specific date - Optimized
+ */
+function getAvailabilityForDate(calendar, dateStr, dateOverrides, dayAvailability, jobSettings, timezone, startTimeDefault, endTimeDefault) {
+  try {
+    // Parse the date
+    var dateParts = dateStr.split('-');
+    if (dateParts.length !== 3) {
+      return { 
+        error: "Invalid date format. Expected YYYY-MM-DD.",
+        availableSlots: [],
+        availabilityType: "N"
+      };
+    }
+    
+    // Create a Date object
+    var year = parseInt(dateParts[0]);
+    var month = parseInt(dateParts[1]) - 1; // 0-indexed month
+    var day = parseInt(dateParts[2]);
+    
+    var date = new Date(year, month, day);
+    
+    // Make sure the date is valid
+    if (isNaN(date.getTime())) {
+      return { 
+        error: "Invalid date.",
+        availableSlots: [],
+        availabilityType: "N"
+      };
+    }
+    
+    // Determine day of week
+    var dayOfWeek = date.getDay();
+    
+    // PRIORITY 1: Check if this date has an override
+    var availabilityType = null;
+    if (dateOverrides && dateOverrides[dateStr]) {
+      availabilityType = dateOverrides[dateStr];
+    }
+    // PRIORITY 2: Use day of week
+    else if (dayAvailability && dayAvailability[dayOfWeek]) {
+      availabilityType = dayAvailability[dayOfWeek];
+    }
+    // PRIORITY 3: Default to not available
+    else {
+      availabilityType = "N";
+    }
+    
+    // Check if the date is available (anything other than "N")
+    if (availabilityType === "N") {
+      return { 
+        error: "This date is not available for booking.",
+        availableSlots: [],
+        availabilityType: availabilityType
+      };
+    }
+    
+    // Get current time in the specified timezone
+    var now = new Date();
+    var nowStr = Utilities.formatDate(now, timezone, "yyyy-MM-dd'T'HH:mm:ss");
+    var nowInTimezone = new Date(nowStr);
+    
+    // Get time slots for this date
+    var result = getTimeSlotsForDate(
+      calendar,
+      date,
+      availabilityType,
+      jobSettings,
+      timezone,
+      startTimeDefault,
+      endTimeDefault,
+      nowInTimezone
+    );
+    
+    // Return the result
+    return {
+      availableSlots: result.slots,
+      availabilityType: availabilityType
+    };
+    
+  } catch (error) {
+    Logger.log("Error in getAvailabilityForDate: " + error.message);
+    return { 
+      error: "Error getting availability: " + error.message,
+      availableSlots: [],
+      availabilityType: "N"
+    };
+  }
+}
+
+/**
+ * Gets time ranges for a specific availability key from the WorkHours sheet
+ */
+function getTimeRangesForKey(key, defaultStartTime, defaultEndTime) {
+  try {
+    // Return default range for "F" (Full availability)
+    if (key === "F") {
+      return [
+        {
+          start: "7:30",
+          end: "12:45"
+        },
+        {
+          start: "12:45",
+          end: "15:30"
+        }
+      ];
+    }
+    
+    // Get access to the spreadsheet
+    var spreadsheet = SpreadsheetApp.openById("1b78ApTXWjfg2Lsfdg3dBATZKGByKIEvCZ3GXOZ_GsYs");
+    
+    // Get cached sheet data or load it
+    var data = getCachedSheetData(spreadsheet, "WorkHours");
+    if (!data || data.length <= 1) {
+      // If sheet not found, return default for "P" (Partial availability) or empty for others
+      if (key === "P") {
+        return [
+          { start: "7:30", end: "8:30" },
+          { start: "13:45", end: "14:30" }
+        ];
+      }
+      return [];
+    }
+    
+    // Column indexes for the time configuration
+    var keyIndex = 0;       // Column A - Key
+    var startTimeIndex = 1; // Column B - startTime
+    var endTimeIndex = 2;   // Column C - endTime
+    var startTime1Index = 3; // Column D - startTime1
+    var endTime1Index = 4;   // Column E - endTime1
+    
+    // Find the matching row for the requested key
+    var timeRanges = [];
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var rowKey = normalizeText(row[keyIndex]);
+      
+      // Case-insensitive match for the key
+      if (rowKey === normalizeText(key)) {
+        // Add the first time range if it exists
+        if (row[startTimeIndex] && row[endTimeIndex]) {
+          timeRanges.push({
+            start: String(row[startTimeIndex]),
+            end: String(row[endTimeIndex])
+          });
+        }
+        
+        // Add the second time range if it exists
+        if (row[startTime1Index] && row[endTime1Index]) {
+          timeRanges.push({
+            start: String(row[startTime1Index]),
+            end: String(row[endTime1Index])
+          });
+        }
+        
+        break;
+      }
+    }
+    
+    return timeRanges;
+    
+  } catch (error) {
+    Logger.log("Error in getTimeRangesForKey: " + error.message);
+    return [];
+  }
+}
+
+/**
+ * Gets available time slots for a date based on availability type - Optimized
+ */
+function getTimeSlotsForDate(calendar, date, availabilityType, jobSettings, timezone, startTimeDefault, endTimeDefault, nowInTimezone) {
+  var slots = [];
+  
+  try {
+    // Set time ranges based on availability type
+    var timeRanges = getTimeRangesForKey(availabilityType, startTimeDefault, endTimeDefault);
+    
+    // If no time ranges were found, return empty slots
+    if (timeRanges.length === 0) {
+      return { slots: [] };
+    }
+    
+    // *** OPTIMIZATION: Fetch all events for the day at once ***
+    // Get the start and end of the day in the specified timezone
+    var dayStart = new Date(date);
+    dayStart.setHours(0, 0, 0, 0);
+    
+    var dayEnd = new Date(date);
+    dayEnd.setHours(23, 59, 59, 999);
+    
+    // Fetch all calendar events for this day in one call
+    var allEvents = calendar.getEvents(dayStart, dayEnd);
+    
+    // Pre-process events to create a conflict map for faster lookups
+    // We'll divide the day into 5-minute intervals and mark which ones have conflicts
+    var conflictMap = {};
+    
+    allEvents.forEach(function(event) {
+      // Skip events that should be ignored for conflict detection
+      if (shouldIgnoreEvent(event)) {
+        return;
+      }
+      
+      var eventStart = event.getStartTime();
+      var eventEnd = event.getEndTime();
+      
+      // Create interval markers from event start to end
+      var intervalStart = new Date(eventStart);
+      
+      // We'll use 5-minute intervals for more accurate conflict detection
+      const intervalMinutes = 5;
+      
+      while (intervalStart < eventEnd) {
+        // Create a key for this 5-minute interval
+        var key = Math.floor(intervalStart.getTime() / (intervalMinutes * 60 * 1000));
+        conflictMap[key] = true;
+        
+        // Move to the next interval
+        intervalStart.setMinutes(intervalStart.getMinutes() + intervalMinutes);
+      }
+    });
+    
+    // Get slots for each time range
+    for (var i = 0; i < timeRanges.length; i++) {
+      var range = timeRanges[i];
+      var rangeSlots = getTimeSlotsForRange(
+        date,
+        range.start,
+        range.end,
+        jobSettings.duration || 30,
+        jobSettings.spacing || 0,
+        jobSettings.minNotice || 1440,
+        jobSettings.startIntervals || 0,
+        timezone,
+        nowInTimezone,
+        conflictMap  // Pass the conflict map for faster conflict checking
+      );
+      
+      // Add slots from this range
+      slots = slots.concat(rangeSlots);
+    }
+    
+    return { slots: slots };
+    
+  } catch (error) {
+    Logger.log("Error in getTimeSlotsForDate: " + error.message);
+    return { slots: [] };
+  }
+}
+
+/**
+ * Gets available time slots for a specific time range - Optimized for performance
+ */
+function getTimeSlotsForRange(date, startTimeStr, endTimeStr, duration, spacing, minNotice, startIntervals, timezone, nowInTimezone, conflictMap) {
+  var slots = [];
+  
+  try {
+    // Create Date objects for start and end times
+    var startTime = new Date(date);
+    var startParts = startTimeStr.split(':');
+    startTime.setHours(parseInt(startParts[0]), parseInt(startParts[1]), 0, 0);
+    
+    var endTime = new Date(date);
+    var endParts = endTimeStr.split(':');
+    endTime.setHours(parseInt(endParts[0]), parseInt(endParts[1]), 0, 0);
+    
+    // Use startIntervals for time slot generation if provided
+    var slotSpacing = startIntervals > 0 ? startIntervals : (duration + spacing);
+    
+    // *** OPTIMIZATION: Calculate earliest allowed time once ***
+    // Get current server time
+    var serverNow = new Date();
+    
+    // Calculate earliest possible slot time based on minNotice
+    var earliestSlotTime = new Date();
+    earliestSlotTime.setTime(serverNow.getTime() + (minNotice * 60 * 1000));
+    
+    // Adjust starting point if it's earlier than the earliest allowed time
+    var currentTime = new Date(startTime);
+    if (currentTime < earliestSlotTime) {
+      // If the earliest allowed time is beyond this entire range, return empty
+      if (earliestSlotTime > endTime) {
+        return [];
+      }
+      
+      // Calculate how many slots to skip
+      var msToAdd = earliestSlotTime.getTime() - currentTime.getTime();
+      var minutesToAdd = Math.ceil(msToAdd / (60 * 1000) / slotSpacing) * slotSpacing;
+      currentTime.setTime(startTime.getTime() + (minutesToAdd * 60 * 1000));
+    }
+    
+    // Generate all possible slots - optimized with conflict map
+    while (currentTime < endTime) {
+      // Create slot end time
+      var slotEnd = new Date(currentTime);
+      slotEnd.setMinutes(slotEnd.getMinutes() + duration);
+      
+      // Skip if this slot ends after the range end time
+      if (slotEnd > endTime) {
+        break;
+      }
+      
+      // Check for conflicts using the conflict map
+      var isSlotAvailable = true;
+      var slotCheckTime = new Date(currentTime);
+      
+      // We're using 5-minute interval checks for accuracy
+      const checkIntervalMinutes = 5;
+      
+      // Check every 5 minutes during the slot duration
+      while (slotCheckTime < slotEnd) {
+        var key = Math.floor(slotCheckTime.getTime() / (checkIntervalMinutes * 60 * 1000));
+        if (conflictMap[key]) {
+          isSlotAvailable = false;
+          break;
+        }
+        slotCheckTime.setMinutes(slotCheckTime.getMinutes() + checkIntervalMinutes);
+      }
+      
+      // If slot is available, add it
+      if (isSlotAvailable) {
+        var slotStr = Utilities.formatDate(currentTime, timezone, "yyyy-MM-dd HH:mm");
+        slots.push(slotStr);
+      }
+      
+      // Move to the next slot
+      currentTime.setMinutes(currentTime.getMinutes() + slotSpacing);
+    }
+    
+    return slots;
+    
+  } catch (error) {
+    Logger.log("Error in getTimeSlotsForRange: " + error.message);
+    return [];
+  }
+}
