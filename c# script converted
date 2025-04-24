@@ -1,0 +1,1180 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Threading.Tasks;
+using System.Linq;
+using Google.Apis.Auth.OAuth2;
+using Google.Apis.Calendar.v3;
+using Google.Apis.Calendar.v3.Data;
+using Google.Apis.Services;
+using Google.Apis.Sheets.v4;
+using Google.Apis.Sheets.v4.Data;
+using Google.Apis.Util.Store;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Http;
+using Newtonsoft.Json;
+using System.Globalization;
+
+namespace CalendarAvailability
+{
+    public class CalendarAvailabilityService
+    {
+        private readonly CalendarService _calendarService;
+        private readonly SheetsService _sheetsService;
+        private readonly string _spreadsheetId = "1b78ApTXWjfg2Lsfdg3dBATZKGByKIEvCZ3GXOZ_GsYs";
+        private static Dictionary<string, IList<IList<object>>> _spreadsheetCache = new Dictionary<string, IList<IList<object>>>();
+
+        public CalendarAvailabilityService()
+        {
+            // Initialize Google Services
+            string[] scopes = { CalendarService.Scope.Calendar, SheetsService.Scope.Spreadsheets };
+            
+            UserCredential credential;
+            using (var stream = new System.IO.FileStream("credentials.json", System.IO.FileMode.Open, System.IO.FileAccess.Read))
+            {
+                credential = GoogleWebAuthorizationBroker.AuthorizeAsync(
+                    GoogleClientSecrets.Load(stream).Secrets,
+                    scopes,
+                    "user",
+                    CancellationToken.None,
+                    new FileDataStore("token.json", true)).Result;
+            }
+
+            _calendarService = new CalendarService(new BaseClientService.Initializer()
+            {
+                HttpClientInitializer = credential,
+                ApplicationName = "Calendar Availability Service",
+            });
+
+            _sheetsService = new SheetsService(new BaseClientService.Initializer()
+            {
+                HttpClientInitializer = credential,
+                ApplicationName = "Calendar Availability Service",
+            });
+        }
+
+        public async Task<IActionResult> HandleGetRequest(
+            string calendarId,
+            string jobType,
+            string startTime,
+            string endTime,
+            bool loadAll,
+            string date,
+            string timezone,
+            bool bypassCache)
+        {
+            if (string.IsNullOrEmpty(calendarId) || string.IsNullOrEmpty(jobType) || 
+                string.IsNullOrEmpty(startTime) || string.IsNullOrEmpty(endTime))
+            {
+                return new JsonResult(new { error = "Missing required parameters" });
+            }
+
+            try
+            {
+                // Check cache first if not bypassing
+                if (!bypassCache && loadAll)
+                {
+                    var cachedData = await GetCachedAvailability(calendarId, jobType);
+                    if (cachedData != null && cachedData.Timestamp != null)
+                    {
+                        var cacheTime = cachedData.Timestamp.Value;
+                        var currentTime = DateTime.UtcNow;
+                        var cacheAgeHours = (currentTime - cacheTime).TotalHours;
+
+                        if (cacheAgeHours < 6)
+                        {
+                            var jobSettings = await GetJobSettings(jobType);
+                            return new JsonResult(new
+                            {
+                                jobDetails = new
+                                {
+                                    title = jobSettings.Title ?? jobType,
+                                    description = jobSettings.Description ?? "",
+                                    duration = jobSettings.Duration
+                                },
+                                availableDates = cachedData.AvailableDates,
+                                calendarTimezone = cachedData.CalendarTimezone,
+                                fromCache = true,
+                                cacheAge = Math.Round(cacheAgeHours, 1) + " hours"
+                            });
+                        }
+                    }
+                }
+
+                // Get calendar
+                var calendar = await GetCalendar(calendarId);
+                if (calendar == null)
+                {
+                    return new JsonResult(new { error = "Calendar not found or access denied" });
+                }
+
+                var operatingTimezone = timezone ?? calendar.TimeZone;
+
+                // Load all required data from spreadsheet
+                var dateOverrides = await GetDateOverrides(calendarId, jobType);
+                var daySettings = await GetDayAvailability(calendarId, jobType);
+                var dayAvailability = ConvertToDayAvailabilityDictionary(daySettings);
+                var jobSettings = await GetJobSettings(jobType);
+
+                var response = new Dictionary<string, object>
+                {
+                    ["jobDetails"] = new
+                    {
+                        title = jobSettings.Title ?? jobType,
+                        description = jobSettings.Description ?? "",
+                        duration = jobSettings.Duration
+                    },
+                    ["calendarTimezone"] = calendar.TimeZone,
+                    ["fromCache"] = false
+                };
+
+                if (loadAll)
+                {
+                    response["availableDates"] = await GetAvailabilityFor30Days(
+                        calendarId, dateOverrides, dayAvailability, jobSettings, 
+                        operatingTimezone, startTime, endTime);
+
+                    // Save to cache
+                    await SaveToCache(calendarId, jobType, response["availableDates"], calendar.TimeZone);
+                    
+                    // Update slots available
+                    await UpdateSlotsAvailable(calendarId, jobType, response["availableDates"]);
+                }
+                else if (!string.IsNullOrEmpty(date))
+                {
+                    var result = await GetAvailabilityForDate(
+                        calendarId, date, dateOverrides, dayAvailability, jobSettings,
+                        operatingTimezone, startTime, endTime);
+
+                    response["availableSlots"] = result.AvailableSlots;
+                    response["availabilityType"] = result.AvailabilityType;
+
+                    if (!string.IsNullOrEmpty(result.Error))
+                    {
+                        response["error"] = result.Error;
+                    }
+                }
+                else
+                {
+                    response["error"] = "Either loadAll must be true or date must be specified";
+                }
+
+                return new JsonResult(response);
+            }
+            catch (Exception ex)
+            {
+                return new JsonResult(new { error = "Server error: " + ex.Message });
+            }
+        }
+
+        public async Task<IActionResult> HandlePostRequest(PostRequestData requestData)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(requestData.CalendarId) || string.IsNullOrEmpty(requestData.JobType) ||
+                    string.IsNullOrEmpty(requestData.Date) || string.IsNullOrEmpty(requestData.Time))
+                {
+                    return new JsonResult(new { success = false, error = "Missing required parameters" });
+                }
+
+                var cachedData = await GetCachedAvailability(requestData.CalendarId, requestData.JobType);
+                if (cachedData == null || cachedData.AvailableDates == null)
+                {
+                    return new JsonResult(new { success = false, error = "Cache not found" });
+                }
+
+                if (cachedData.AvailableDates.ContainsKey(requestData.Date) &&
+                    cachedData.AvailableDates[requestData.Date].Slots != null)
+                {
+                    var slots = cachedData.AvailableDates[requestData.Date].Slots;
+                    var index = slots.IndexOf(requestData.Time);
+
+                    if (index != -1)
+                    {
+                        slots.RemoveAt(index);
+
+                        if (slots.Count == 0)
+                        {
+                            cachedData.AvailableDates.Remove(requestData.Date);
+                        }
+
+                        await SaveToCache(requestData.CalendarId, requestData.JobType, cachedData.AvailableDates, cachedData.CalendarTimezone);
+                        await UpdateSlotsAvailable(requestData.CalendarId, requestData.JobType, cachedData.AvailableDates);
+
+                        return new JsonResult(new { success = true, message = "Time slot removed from cache" });
+                    }
+                    else
+                    {
+                        return new JsonResult(new { success = false, error = "Time slot not found in cache" });
+                    }
+                }
+                else
+                {
+                    return new JsonResult(new { success = false, error = "Date not found in cache" });
+                }
+            }
+            catch (Exception ex)
+            {
+                return new JsonResult(new { success = false, error = "Server error: " + ex.Message });
+            }
+        }
+
+        private async Task<IList<IList<object>>> GetCachedSheetData(string sheetName)
+        {
+            if (!_spreadsheetCache.ContainsKey(sheetName))
+            {
+                var range = $"{sheetName}!A:Z";
+                var request = _sheetsService.Spreadsheets.Values.Get(_spreadsheetId, range);
+                var response = await request.ExecuteAsync();
+                _spreadsheetCache[sheetName] = response.Values;
+            }
+
+            return _spreadsheetCache[sheetName];
+        }
+
+        private async Task<CachedAvailabilityData> GetCachedAvailability(string calendarId, string jobType)
+        {
+            try
+            {
+                var data = await GetCachedSheetData("AvailabilityCache");
+                if (data == null || data.Count <= 1)
+                {
+                    return null;
+                }
+
+                var calendarIdIndex = 0;
+                var jobTypeIndex = 1;
+                var lastUpdatedIndex = 2;
+                var availabilityDataIndex = 3;
+
+                var normalizedCalendarId = NormalizeText(calendarId);
+                var normalizedJobType = NormalizeText(jobType);
+
+                foreach (var row in data.Skip(1))
+                {
+                    if (row.Count <= availabilityDataIndex) continue;
+
+                    var rowCalendarId = NormalizeText(row[calendarIdIndex].ToString());
+                    var rowJobType = NormalizeText(row[jobTypeIndex].ToString());
+
+                    if (rowCalendarId == normalizedCalendarId && rowJobType == normalizedJobType)
+                    {
+                        var timestamp = DateTime.Parse(row[lastUpdatedIndex].ToString());
+                        
+                        try
+                        {
+                            var availabilityData = JsonConvert.DeserializeObject<AvailabilityData>(row[availabilityDataIndex].ToString());
+                            return new CachedAvailabilityData
+                            {
+                                Timestamp = timestamp,
+                                AvailableDates = availabilityData.Dates,
+                                CalendarTimezone = availabilityData.Timezone ?? "Etc/UTC"
+                            };
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+                    }
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetCachedAvailability: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<bool> SaveToCache(string calendarId, string jobType, object availabilityData, string timezone)
+        {
+            try
+            {
+                var data = await GetCachedSheetData("AvailabilityCache");
+                var timestamp = DateTime.UtcNow;
+                
+                var cacheData = JsonConvert.SerializeObject(new
+                {
+                    dates = availabilityData,
+                    timezone = timezone
+                });
+
+                var normalizedCalendarId = NormalizeText(calendarId);
+                var normalizedJobType = NormalizeText(jobType);
+
+                int rowIndex = -1;
+                for (int i = 1; i < data.Count; i++)
+                {
+                    if (data[i].Count < 4) continue;
+
+                    var rowCalendarId = NormalizeText(data[i][0].ToString());
+                    var rowJobType = NormalizeText(data[i][1].ToString());
+
+                    if (rowCalendarId == normalizedCalendarId && rowJobType == normalizedJobType)
+                    {
+                        rowIndex = i;
+                        break;
+                    }
+                }
+
+                var valueRange = new ValueRange
+                {
+                    Values = new List<IList<object>> { new List<object> { calendarId, jobType, timestamp, cacheData } }
+                };
+
+                if (rowIndex > 0)
+                {
+                    // Update existing row
+                    var updateRequest = _sheetsService.Spreadsheets.Values.Update(
+                        valueRange, 
+                        _spreadsheetId, 
+                        $"AvailabilityCache!A{rowIndex + 1}:D{rowIndex + 1}"
+                    );
+                    updateRequest.ValueInputOption = SpreadsheetsResource.ValuesResource.UpdateRequest.ValueInputOptionEnum.RAW;
+                    await updateRequest.ExecuteAsync();
+                }
+                else
+                {
+                    // Append new row
+                    var appendRequest = _sheetsService.Spreadsheets.Values.Append(
+                        valueRange,
+                        _spreadsheetId,
+                        "AvailabilityCache!A:D"
+                    );
+                    appendRequest.ValueInputOption = SpreadsheetsResource.ValuesResource.AppendRequest.ValueInputOptionEnum.RAW;
+                    await appendRequest.ExecuteAsync();
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in SaveToCache: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<bool> UpdateSlotsAvailable(string calendarId, string jobType, object availabilityData)
+        {
+            try
+            {
+                var data = await GetCachedSheetData("SlotsAvailable");
+                var timestamp = DateTime.UtcNow;
+                
+                // Count total slots
+                int totalSlots = 0;
+                if (availabilityData is Dictionary<string, DateAvailability> availabilityDict)
+                {
+                    foreach (var dateEntry in availabilityDict)
+                    {
+                        if (dateEntry.Value?.Slots != null)
+                        {
+                            totalSlots += dateEntry.Value.Slots.Count;
+                        }
+                    }
+                }
+
+                var normalizedCalendarId = NormalizeText(calendarId);
+                var normalizedJobType = NormalizeText(jobType);
+
+                int rowIndex = -1;
+                for (int i = 1; i < data.Count; i++)
+                {
+                    if (data[i].Count < 4) continue;
+
+                    var rowCalendarId = NormalizeText(data[i][0].ToString());
+                    var rowJobType = NormalizeText(data[i][1].ToString());
+
+                    if (rowCalendarId == normalizedCalendarId && rowJobType == normalizedJobType)
+                    {
+                        rowIndex = i;
+                        break;
+                    }
+                }
+
+                var valueRange = new ValueRange
+                {
+                    Values = new List<IList<object>> { new List<object> { calendarId, jobType, totalSlots, timestamp } }
+                };
+
+                if (rowIndex > 0)
+                {
+                    // Update existing row
+                    var updateRequest = _sheetsService.Spreadsheets.Values.Update(
+                        valueRange,
+                        _spreadsheetId,
+                        $"SlotsAvailable!A{rowIndex + 1}:D{rowIndex + 1}"
+                    );
+                    updateRequest.ValueInputOption = SpreadsheetsResource.ValuesResource.UpdateRequest.ValueInputOptionEnum.RAW;
+                    await updateRequest.ExecuteAsync();
+                }
+                else
+                {
+                    // Append new row
+                    var appendRequest = _sheetsService.Spreadsheets.Values.Append(
+                        valueRange,
+                        _spreadsheetId,
+                        "SlotsAvailable!A:D"
+                    );
+                    appendRequest.ValueInputOption = SpreadsheetsResource.ValuesResource.AppendRequest.ValueInputOptionEnum.RAW;
+                    await appendRequest.ExecuteAsync();
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in UpdateSlotsAvailable: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<Dictionary<string, string>> GetDateOverrides(string calendarId, string jobType)
+        {
+            var overrides = new Dictionary<string, string>();
+
+            try
+            {
+                var data = await GetCachedSheetData("DateOverrides");
+                if (data == null || data.Count <= 1)
+                {
+                    return overrides;
+                }
+
+                var scriptTimezone = TimeZoneInfo.Local;
+                var normalizedCalendarId = NormalizeText(calendarId);
+                var normalizedJobType = NormalizeText(jobType);
+
+                foreach (var row in data.Skip(1))
+                {
+                    if (row.Count < 4) continue;
+
+                    var rowCalendarId = NormalizeText(row[0].ToString());
+                    var rowJobType = NormalizeText(row[1].ToString());
+                    
+                    if (rowCalendarId == normalizedCalendarId && rowJobType == normalizedJobType)
+                    {
+                        if (DateTime.TryParse(row[2].ToString(), out DateTime dateValue))
+                        {
+                            var dateStr = dateValue.ToString("yyyy-MM-dd");
+                            var overrideValue = row[3].ToString().Trim().ToUpper();
+                            overrides[dateStr] = overrideValue;
+                        }
+                    }
+                }
+
+                return overrides;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetDateOverrides: {ex.Message}");
+                return overrides;
+            }
+        }
+
+        private async Task<DayAvailability> GetDayAvailability(string calendarId, string jobType)
+        {
+            var availability = new DayAvailability
+            {
+                Sunday = "N",
+                Monday = "N",
+                Tuesday = "N",
+                Wednesday = "N",
+                Thursday = "N",
+                Friday = "N",
+                Saturday = "N"
+            };
+
+            try
+            {
+                var data = await GetCachedSheetData("Show Alternative Days");
+                if (data == null || data.Count <= 1)
+                {
+                    return availability;
+                }
+
+                var headers = data[0];
+                var columnIndexes = GetDayAvailabilityColumnIndexes(headers);
+
+                if (columnIndexes.CalendarIdIndex == -1 || columnIndexes.JobTypeIndex == -1)
+                {
+                    return availability;
+                }
+
+                var normalizedCalendarId = NormalizeText(calendarId);
+                var normalizedJobType = NormalizeText(jobType);
+
+                foreach (var row in data.Skip(1))
+                {
+                    if (row.Count <= Math.Max(columnIndexes.CalendarIdIndex, columnIndexes.JobTypeIndex))
+                        continue;
+
+                    var rowCalendarId = NormalizeText(row[columnIndexes.CalendarIdIndex].ToString());
+                    var rowJobType = NormalizeText(row[columnIndexes.JobTypeIndex].ToString());
+
+                    if (rowCalendarId == normalizedCalendarId && rowJobType == normalizedJobType)
+                    {
+                        availability.Sunday = GetDayValue(row, columnIndexes.DayIndexes["sunday"]);
+                        availability.Monday = GetDayValue(row, columnIndexes.DayIndexes["monday"]);
+                        availability.Tuesday = GetDayValue(row, columnIndexes.DayIndexes["tuesday"]);
+                        availability.Wednesday = GetDayValue(row, columnIndexes.DayIndexes["wednesday"]);
+                        availability.Thursday = GetDayValue(row, columnIndexes.DayIndexes["thursday"]);
+                        availability.Friday = GetDayValue(row, columnIndexes.DayIndexes["friday"]);
+                        availability.Saturday = GetDayValue(row, columnIndexes.DayIndexes["saturday"]);
+                        break;
+                    }
+                }
+
+                return availability;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetDayAvailability: {ex.Message}");
+                return availability;
+            }
+        }
+
+        private string GetDayValue(IList<object> row, int index)
+        {
+            if (index == -1 || index >= row.Count)
+                return "N";
+
+            var value = row[index]?.ToString()?.Trim().ToUpper() ?? "N";
+            
+            // Validate the value
+            if (value != "F" && value != "P" && value != "N" && 
+                value != "M" && value != "L" && value != "A" && 
+                value != "E" && value != "O")
+            {
+                return "N";
+            }
+
+            return value;
+        }
+
+        private DayAvailabilityColumnIndexes GetDayAvailabilityColumnIndexes(IList<object> headers)
+        {
+            var indexes = new DayAvailabilityColumnIndexes
+            {
+                CalendarIdIndex = -1,
+                JobTypeIndex = -1,
+                DayIndexes = new Dictionary<string, int>()
+            };
+
+            for (int i = 0; i < headers.Count; i++)
+            {
+                var header = NormalizeText(headers[i].ToString());
+
+                if (header == "calendarid" || header == "calendar id" || header == "calendar")
+                    indexes.CalendarIdIndex = i;
+                else if (header == "jobtype" || header == "job type" || header == "job")
+                    indexes.JobTypeIndex = i;
+                else if (header == "sunday" || header == "sun" || header == "su")
+                    indexes.DayIndexes["sunday"] = i;
+                else if (header == "monday" || header == "mon" || header == "mo")
+                    indexes.DayIndexes["monday"] = i;
+                else if (header == "tuesday" || header == "tue" || header == "tu")
+                    indexes.DayIndexes["tuesday"] = i;
+                else if (header == "wednesday" || header == "wed" || header == "we")
+                    indexes.DayIndexes["wednesday"] = i;
+                else if (header == "thursday" || header == "thu" || header == "th")
+                    indexes.DayIndexes["thursday"] = i;
+                else if (header == "friday" || header == "fri" || header == "fr")
+                    indexes.DayIndexes["friday"] = i;
+                else if (header == "saturday" || header == "sat" || header == "sa")
+                    indexes.DayIndexes["saturday"] = i;
+            }
+
+            return indexes;
+        }
+
+        private async Task<JobSettings> GetJobSettings(string jobType)
+        {
+            var settings = new JobSettings
+            {
+                Duration = 30,
+                Spacing = 0,
+                MinNotice = 1440,
+                StartIntervals = 0,
+                Title = "",
+                Description = ""
+            };
+
+            try
+            {
+                var data = await GetCachedSheetData("JobTypesConfiguration");
+                if (data == null || data.Count <= 1)
+                {
+                    return settings;
+                }
+
+                // Hardcoded column indexes
+                var jobTypeIndex = 0;
+                var durationIndex = 1;
+                var spacingIndex = 2;
+                var minNoticeIndex = 3;
+                var startIntervalsIndex = 4;
+                var titleIndex = 5;
+                var descriptionIndex = 6;
+
+                var normalizedTargetJobType = NormalizeText(jobType);
+
+                foreach (var row in data.Skip(1))
+                {
+                    if (row.Count <= jobTypeIndex) continue;
+
+                    var rowJobType = NormalizeText(row[jobTypeIndex].ToString());
+
+                    if (rowJobType == normalizedTargetJobType)
+                    {
+                        if (durationIndex < row.Count && row[durationIndex] != null)
+                            settings.Duration = ParseNumericValue(row[durationIndex]);
+
+                        if (spacingIndex < row.Count && row[spacingIndex] != null)
+                            settings.Spacing = ParseNumericValue(row[spacingIndex]);
+
+                        if (minNoticeIndex < row.Count && row[minNoticeIndex] != null)
+                            settings.MinNotice = ParseNumericValue(row[minNoticeIndex]);
+
+                        if (startIntervalsIndex < row.Count && row[startIntervalsIndex] != null)
+                            settings.StartIntervals = ParseNumericValue(row[startIntervalsIndex]);
+
+                        if (titleIndex < row.Count && row[titleIndex] != null)
+                            settings.Title = row[titleIndex].ToString();
+
+                        if (descriptionIndex < row.Count && row[descriptionIndex] != null)
+                            settings.Description = row[descriptionIndex].ToString();
+
+                        break;
+                    }
+                }
+
+                return settings;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetJobSettings: {ex.Message}");
+                return settings;
+            }
+        }
+
+        private string NormalizeText(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return "";
+
+            return text.Trim().ToLower();
+        }
+
+        private int ParseNumericValue(object value)
+        {
+            if (value is int intValue)
+                return intValue;
+
+            if (value is double doubleValue)
+                return (int)doubleValue;
+
+            if (value is string stringValue)
+            {
+                stringValue = new string(stringValue.Where(c => char.IsDigit(c) || c == '.').ToArray());
+                if (double.TryParse(stringValue, out double result))
+                    return (int)result;
+            }
+
+            return 0;
+        }
+
+        private async Task<CalendarListEntry> GetCalendar(string calendarId)
+        {
+            try
+            {
+                var calendar = await _calendarService.CalendarList.Get(calendarId).ExecuteAsync();
+                return calendar;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private async Task<Dictionary<string, DateAvailability>> GetAvailabilityFor30Days(
+            string calendarId,
+            Dictionary<string, string> dateOverrides,
+            Dictionary<string, string> dayAvailability,
+            JobSettings jobSettings,
+            string timezone,
+            string startTimeDefault,
+            string endTimeDefault)
+        {
+            var availability = new Dictionary<string, DateAvailability>();
+            var now = DateTime.Now;
+            var timeZoneInfo = TimeZoneInfo.FindSystemTimeZoneById(timezone);
+            var nowInTimezone = TimeZoneInfo.ConvertTime(now, timeZoneInfo);
+
+            // Pre-process dates
+            var datesWithAvailability = new List<(DateTime Date, string DateStr, string AvailabilityType)>();
+
+            for (int i = 0; i < 60; i++)
+            {
+                var date = nowInTimezone.AddDays(i);
+                var dateStr = date.ToString("yyyy-MM-dd");
+                var dayOfWeek = date.DayOfWeek;
+
+                var availabilityType = "N";
+                if (dateOverrides.ContainsKey(dateStr))
+                {
+                    availabilityType = dateOverrides[dateStr];
+                }
+                else if (dayAvailability.ContainsKey(dayOfWeek.ToString("d")))
+                {
+                    availabilityType = dayAvailability[dayOfWeek.ToString("d")];
+                }
+
+                if (availabilityType != "N")
+                {
+                    datesWithAvailability.Add((date, dateStr, availabilityType));
+                }
+            }
+
+            // Process dates in batches
+            const int batchSize = 5;
+            for (int i = 0; i < datesWithAvailability.Count; i += batchSize)
+            {
+                var batch = datesWithAvailability.Skip(i).Take(batchSize);
+
+                foreach (var dateInfo in batch)
+                {
+                    var result = await GetTimeSlotsForDate(
+                        calendarId,
+                        dateInfo.Date,
+                        dateInfo.AvailabilityType,
+                        jobSettings,
+                        timezone,
+                        startTimeDefault,
+                        endTimeDefault,
+                        nowInTimezone);
+
+                    if (result.Slots?.Count > 0)
+                    {
+                        availability[dateInfo.DateStr] = new DateAvailability
+                        {
+                            Slots = result.Slots,
+                            AvailabilityType = dateInfo.AvailabilityType
+                        };
+                    }
+                }
+            }
+
+            return availability;
+        }
+
+        private async Task<DateAvailabilityResult> GetAvailabilityForDate(
+            string calendarId,
+            string dateStr,
+            Dictionary<string, string> dateOverrides,
+            Dictionary<string, string> dayAvailability,
+            JobSettings jobSettings,
+            string timezone,
+            string startTimeDefault,
+            string endTimeDefault)
+        {
+            try
+            {
+                if (!DateTime.TryParseExact(dateStr, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime date))
+                {
+                    return new DateAvailabilityResult
+                    {
+                        Error = "Invalid date format. Expected YYYY-MM-DD.",
+                        AvailableSlots = new List<string>(),
+                        AvailabilityType = "N"
+                    };
+                }
+
+                var dayOfWeek = date.DayOfWeek;
+                var availabilityType = "N";
+
+                if (dateOverrides.ContainsKey(dateStr))
+                {
+                    availabilityType = dateOverrides[dateStr];
+                }
+                else if (dayAvailability.ContainsKey(dayOfWeek.ToString("d")))
+                {
+                    availabilityType = dayAvailability[dayOfWeek.ToString("d")];
+                }
+
+                if (availabilityType == "N")
+                {
+                    return new DateAvailabilityResult
+                    {
+                        Error = "This date is not available for booking.",
+                        AvailableSlots = new List<string>(),
+                        AvailabilityType = availabilityType
+                    };
+                }
+
+                var now = DateTime.Now;
+                var timeZoneInfo = TimeZoneInfo.FindSystemTimeZoneById(timezone);
+                var nowInTimezone = TimeZoneInfo.ConvertTime(now, timeZoneInfo);
+
+                var result = await GetTimeSlotsForDate(
+                    calendarId,
+                    date,
+                    availabilityType,
+                    jobSettings,
+                    timezone,
+                    startTimeDefault,
+                    endTimeDefault,
+                    nowInTimezone);
+
+                return new DateAvailabilityResult
+                {
+                    AvailableSlots = result.Slots ?? new List<string>(),
+                    AvailabilityType = availabilityType
+                };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetAvailabilityForDate: {ex.Message}");
+                return new DateAvailabilityResult
+                {
+                    Error = "Error getting availability: " + ex.Message,
+                    AvailableSlots = new List<string>(),
+                    AvailabilityType = "N"
+                };
+            }
+        }
+
+        private async Task<List<TimeRange>> GetTimeRangesForKey(string key, string defaultStartTime, string defaultEndTime)
+        {
+            try
+            {
+                // Return default range for "F" (Full availability)
+                if (key == "F")
+                {
+                    return new List<TimeRange>
+                    {
+                        new TimeRange { Start = "7:30", End = "12:45" },
+                        new TimeRange { Start = "12:45", End = "15:30" }
+                    };
+                }
+
+                var data = await GetCachedSheetData("WorkHours");
+                if (data == null || data.Count <= 1)
+                {
+                    if (key == "P")
+                    {
+                        return new List<TimeRange>
+                        {
+                            new TimeRange { Start = "7:30", End = "8:30" },
+                            new TimeRange { Start = "13:45", End = "14:30" }
+                        };
+                    }
+                    return new List<TimeRange>();
+                }
+
+                // Column indexes
+                var keyIndex = 0;
+                var startTimeIndex = 1;
+                var endTimeIndex = 2;
+                var startTime1Index = 3;
+                var endTime1Index = 4;
+
+                var timeRanges = new List<TimeRange>();
+
+                foreach (var row in data.Skip(1))
+                {
+                    if (row.Count <= keyIndex) continue;
+
+                    var rowKey = NormalizeText(row[keyIndex].ToString());
+
+                    if (rowKey == NormalizeText(key))
+                    {
+                        if (startTimeIndex < row.Count && endTimeIndex < row.Count &&
+                            row[startTimeIndex] != null && row[endTimeIndex] != null)
+                        {
+                            timeRanges.Add(new TimeRange
+                            {
+                                Start = row[startTimeIndex].ToString(),
+                                End = row[endTimeIndex].ToString()
+                            });
+                        }
+
+                        if (startTime1Index < row.Count && endTime1Index < row.Count &&
+                            row[startTime1Index] != null && row[endTime1Index] != null)
+                        {
+                            timeRanges.Add(new TimeRange
+                            {
+                                Start = row[startTime1Index].ToString(),
+                                End = row[endTime1Index].ToString()
+                            });
+                        }
+
+                        break;
+                    }
+                }
+
+                return timeRanges;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetTimeRangesForKey: {ex.Message}");
+                return new List<TimeRange>();
+            }
+        }
+
+        private async Task<TimeSlotsResult> GetTimeSlotsForDate(
+            string calendarId,
+            DateTime date,
+            string availabilityType,
+            JobSettings jobSettings,
+            string timezone,
+            string startTimeDefault,
+            string endTimeDefault,
+            DateTime nowInTimezone)
+        {
+            var slots = new List<string>();
+
+            try
+            {
+                var timeRanges = await GetTimeRangesForKey(availabilityType, startTimeDefault, endTimeDefault);
+
+                if (timeRanges.Count == 0)
+                {
+                    return new TimeSlotsResult { Slots = slots };
+                }
+
+                // Get day start and end
+                var dayStart = date.Date;
+                var dayEnd = dayStart.AddDays(1).AddSeconds(-1);
+
+                // Fetch all events for the day
+                var request = _calendarService.Events.List(calendarId);
+                request.TimeMin = dayStart;
+                request.TimeMax = dayEnd;
+                request.SingleEvents = true;
+                var events = await request.ExecuteAsync();
+
+                // Create conflict map
+                var conflictMap = new Dictionary<long, bool>();
+                const int intervalMinutes = 5;
+
+                foreach (var evt in events.Items)
+                {
+                    if (ShouldIgnoreEvent(evt))
+                        continue;
+
+                    var eventStart = evt.Start.DateTime ?? DateTime.Parse(evt.Start.Date);
+                    var eventEnd = evt.End.DateTime ?? DateTime.Parse(evt.End.Date);
+
+                    var intervalStart = new DateTime(eventStart.Ticks);
+
+                    while (intervalStart < eventEnd)
+                    {
+                        var key = intervalStart.Ticks / (intervalMinutes * TimeSpan.TicksPerMinute);
+                        conflictMap[key] = true;
+                        intervalStart = intervalStart.AddMinutes(intervalMinutes);
+                    }
+                }
+
+                foreach (var range in timeRanges)
+                {
+                    var rangeSlots = GetTimeSlotsForRange(
+                        date,
+                        range.Start,
+                        range.End,
+                        jobSettings.Duration,
+                        jobSettings.Spacing,
+                        jobSettings.MinNotice,
+                        jobSettings.StartIntervals,
+                        timezone,
+                        nowInTimezone,
+                        conflictMap);
+
+                    slots.AddRange(rangeSlots);
+                }
+
+                return new TimeSlotsResult { Slots = slots };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetTimeSlotsForDate: {ex.Message}");
+                return new TimeSlotsResult { Slots = slots };
+            }
+        }
+
+        private List<string> GetTimeSlotsForRange(
+            DateTime date,
+            string startTimeStr,
+            string endTimeStr,
+            int duration,
+            int spacing,
+            int minNotice,
+            int startIntervals,
+            string timezone,
+            DateTime nowInTimezone,
+            Dictionary<long, bool> conflictMap)
+        {
+            var slots = new List<string>();
+
+            try
+            {
+                var startParts = startTimeStr.Split(':');
+                var startTime = new DateTime(date.Year, date.Month, date.Day,
+                    int.Parse(startParts[0]), int.Parse(startParts[1]), 0);
+
+                var endParts = endTimeStr.Split(':');
+                var endTime = new DateTime(date.Year, date.Month, date.Day,
+                    int.Parse(endParts[0]), int.Parse(endParts[1]), 0);
+
+                var slotSpacing = startIntervals > 0 ? startIntervals : (duration + spacing);
+
+                var serverNow = DateTime.Now;
+                var earliestSlotTime = serverNow.AddMinutes(minNotice);
+
+                var currentTime = new DateTime(startTime.Ticks);
+                if (currentTime < earliestSlotTime)
+                {
+                    if (earliestSlotTime > endTime)
+                        return slots;
+
+                    var msToAdd = earliestSlotTime.Ticks - currentTime.Ticks;
+                    var minutesToAdd = (int)Math.Ceiling(msToAdd / TimeSpan.TicksPerMinute / slotSpacing) * slotSpacing;
+                    currentTime = startTime.AddMinutes(minutesToAdd);
+                }
+
+                const int checkIntervalMinutes = 5;
+
+                while (currentTime < endTime)
+                {
+                    var slotEnd = currentTime.AddMinutes(duration);
+
+                    if (slotEnd > endTime)
+                        break;
+
+                    var isSlotAvailable = true;
+                    var slotCheckTime = new DateTime(currentTime.Ticks);
+
+                    while (slotCheckTime < slotEnd)
+                    {
+                        var key = slotCheckTime.Ticks / (checkIntervalMinutes * TimeSpan.TicksPerMinute);
+                        if (conflictMap.ContainsKey(key))
+                        {
+                            isSlotAvailable = false;
+                            break;
+                        }
+                        slotCheckTime = slotCheckTime.AddMinutes(checkIntervalMinutes);
+                    }
+
+                    if (isSlotAvailable)
+                    {
+                        var slotStr = currentTime.ToString("yyyy-MM-dd HH:mm");
+                        slots.Add(slotStr);
+                    }
+
+                    currentTime = currentTime.AddMinutes(slotSpacing);
+                }
+
+                return slots;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in GetTimeSlotsForRange: {ex.Message}");
+                return slots;
+            }
+        }
+
+        private bool ShouldIgnoreEvent(Event evt)
+        {
+            return evt.Summary?.Contains("#") ?? false;
+        }
+
+        private Dictionary<string, string> ConvertToDayAvailabilityDictionary(DayAvailability daySettings)
+        {
+            return new Dictionary<string, string>
+            {
+                ["0"] = daySettings.Sunday,
+                ["1"] = daySettings.Monday,
+                ["2"] = daySettings.Tuesday,
+                ["3"] = daySettings.Wednesday,
+                ["4"] = daySettings.Thursday,
+                ["5"] = daySettings.Friday,
+                ["6"] = daySettings.Saturday
+            };
+        }
+    }
+
+    // Supporting classes
+    public class PostRequestData
+    {
+        public string CalendarId { get; set; }
+        public string JobType { get; set; }
+        public string Date { get; set; }
+        public string Time { get; set; }
+    }
+
+    public class CachedAvailabilityData
+    {
+        public DateTime? Timestamp { get; set; }
+        public Dictionary<string, DateAvailability> AvailableDates { get; set; }
+        public string CalendarTimezone { get; set; }
+    }
+
+    public class AvailabilityData
+    {
+        public Dictionary<string, DateAvailability> Dates { get; set; }
+        public string Timezone { get; set; }
+    }
+
+    public class DateAvailability
+    {
+        public List<string> Slots { get; set; }
+        public string AvailabilityType { get; set; }
+    }
+
+    public class DayAvailability
+    {
+        public string Sunday { get; set; }
+        public string Monday { get; set; }
+        public string Tuesday { get; set; }
+        public string Wednesday { get; set; }
+        public string Thursday { get; set; }
+        public string Friday { get; set; }
+        public string Saturday { get; set; }
+    }
+
+    public class JobSettings
+    {
+        public int Duration { get; set; }
+        public int Spacing { get; set; }
+        public int MinNotice { get; set; }
+        public int StartIntervals { get; set; }
+        public string Title { get; set; }
+        public string Description { get; set; }
+    }
+
+    public class DateAvailabilityResult
+    {
+        public string Error { get; set; }
+        public List<string> AvailableSlots { get; set; }
+        public string AvailabilityType { get; set; }
+    }
+
+    public class TimeRange
+    {
+        public string Start { get; set; }
+        public string End { get; set; }
+    }
+
+    public class TimeSlotsResult
+    {
+        public List<string> Slots { get; set; }
+    }
+
+    public class DayAvailabilityColumnIndexes
+    {
+        public int CalendarIdIndex { get; set; }
+        public int JobTypeIndex { get; set; }
+        public Dictionary<string, int> DayIndexes { get; set; }
+    }
+}
